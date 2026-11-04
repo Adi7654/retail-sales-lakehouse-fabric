@@ -8,6 +8,8 @@
 # MAGIC - **Deduplication:** one row per business key, keeping the most recent ingest
 # MAGIC - **Enrichment:** English product category names joined in
 # MAGIC - **Lineage:** `_load_date` carried from bronze, `_processed_at` added
+# MAGIC - **Incremental writes:** each row gets a `_row_hash`; tables are updated with Delta **MERGE**, so only
+# MAGIC   new or changed rows are written and get a fresh `_processed_at`. Gold uses that timestamp as its watermark.
 
 # COMMAND ----------
 
@@ -56,16 +58,52 @@ def dedup(df, keys, order_cols=None):
 
 results = []
 
-def save(df, table, rows_in):
-    """Write a silver table and record row counts for the summary."""
+def row_hash(cols):
+    """Fingerprint of the business columns: changes whenever any value changes."""
+    return F.sha2(F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("<null>")) for c in cols]), 256)
+
+
+def save(df, table, rows_in, keys=None):
+    """Write a silver table.
+
+    First run (or tables without a key): full overwrite.
+    Later runs: Delta MERGE on the business key:
+      - changed rows (different _row_hash) are updated
+      - new rows are inserted
+      - rows no longer in the source snapshot are deleted
+    Unchanged rows are not touched, so their _processed_at stays the same.
+    """
     target = f"{SILVER}.{table}"
-    (df.withColumn("_processed_at", F.current_timestamp())
-       .write.mode("overwrite").format("delta")
-       .option("overwriteSchema", "true")
-       .saveAsTable(target))
+    business_cols = [c for c in df.columns if not c.startswith("_")]
+    df = (df.withColumn("_row_hash", row_hash(business_cols))
+            .withColumn("_processed_at", F.current_timestamp()))
+
+    can_merge = (keys is not None and spark.catalog.tableExists(target)
+                 and "_row_hash" in spark.table(target).columns)
+
+    if can_merge:
+        df.createOrReplaceTempView("silver_src")
+        on = " AND ".join(f"t.{k} = s.{k}" for k in keys)
+        out = spark.sql(f"""
+            MERGE INTO {target} t
+            USING silver_src s
+            ON {on}
+            WHEN MATCHED AND t._row_hash <> s._row_hash THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+            WHEN NOT MATCHED BY SOURCE THEN DELETE
+        """).collect()
+        m = out[0].asDict() if out else {}
+        write = (f"MERGE: {m.get('num_inserted_rows', 0):,} ins / "
+                 f"{m.get('num_updated_rows', 0):,} upd / {m.get('num_deleted_rows', 0):,} del")
+    else:
+        (df.write.mode("overwrite").format("delta")
+           .option("overwriteSchema", "true")
+           .saveAsTable(target))
+        write = "full overwrite"
+
     rows_out = spark.table(target).count()
-    results.append((table, rows_in, rows_out, rows_in - rows_out))
-    print(f"{target}: {rows_in:,} in → {rows_out:,} out ({rows_in - rows_out:,} removed)")
+    results.append((table, rows_in, rows_out, rows_in - rows_out, write))
+    print(f"{target}: {rows_in:,} in → {rows_out:,} rows  [{write}]")
 
 # COMMAND ----------
 
@@ -85,7 +123,7 @@ customers = dedup(
     ).filter("customer_id IS NOT NULL"),
     ["customer_id"],
 )
-save(customers, "customers", raw.count())
+save(customers, "customers", raw.count(), ["customer_id"])
 
 raw = spark.table(f"{BRONZE}.sellers")
 sellers = dedup(
@@ -98,7 +136,7 @@ sellers = dedup(
     ).filter("seller_id IS NOT NULL"),
     ["seller_id"],
 )
-save(sellers, "sellers", raw.count())
+save(sellers, "sellers", raw.count(), ["seller_id"])
 
 # COMMAND ----------
 
@@ -122,7 +160,7 @@ geolocation = (
     .filter(F.col("lat").between(-34.0, 5.5) & F.col("lng").between(-74.0, -34.5))
     .dropDuplicates(["zip_code_prefix", "lat", "lng", "city", "state"])
 )
-save(geolocation, "geolocation", raw.count())
+save(geolocation, "geolocation", raw.count())   # no business key → always overwrite
 
 # COMMAND ----------
 
@@ -145,7 +183,7 @@ orders = dedup(
     ).filter("order_id IS NOT NULL"),
     ["order_id"],
 )
-save(orders, "orders", raw.count())
+save(orders, "orders", raw.count(), ["order_id"])
 
 # COMMAND ----------
 
@@ -167,7 +205,7 @@ order_items = dedup(
     ).filter("order_id IS NOT NULL AND order_item_id IS NOT NULL"),
     ["order_id", "order_item_id"],
 )
-save(order_items, "order_items", raw.count())
+save(order_items, "order_items", raw.count(), ["order_id", "order_item_id"])
 
 raw = spark.table(f"{BRONZE}.order_payments")
 order_payments = dedup(
@@ -181,7 +219,7 @@ order_payments = dedup(
     ).filter("order_id IS NOT NULL AND payment_sequential IS NOT NULL"),
     ["order_id", "payment_sequential"],
 )
-save(order_payments, "order_payments", raw.count())
+save(order_payments, "order_payments", raw.count(), ["order_id", "payment_sequential"])
 
 # The same review can appear more than once: keep the most recently answered version
 raw = spark.table(f"{BRONZE}.order_reviews")
@@ -199,7 +237,7 @@ order_reviews = dedup(
     ["review_id", "order_id"],
     [F.col("review_answer_ts").desc_nulls_last(), F.col("_ingested_at").desc()],
 )
-save(order_reviews, "order_reviews", raw.count())
+save(order_reviews, "order_reviews", raw.count(), ["review_id", "order_id"])
 
 # COMMAND ----------
 
@@ -218,7 +256,7 @@ translation = (
     .dropDuplicates(["product_category_name"])
 )
 save(translation, "category_translation",
-     spark.table(f"{BRONZE}.category_translation").count())
+     spark.table(f"{BRONZE}.category_translation").count(), ["product_category_name"])
 
 raw = spark.table(f"{BRONZE}.products")
 products = dedup(
@@ -244,7 +282,7 @@ products = (
                 F.coalesce("product_category_name_english",
                            F.col("product_category_name")))
 )
-save(products, "products", raw.count())
+save(products, "products", raw.count(), ["product_id"])
 
 # COMMAND ----------
 
@@ -252,7 +290,7 @@ save(products, "products", raw.count())
 
 # COMMAND ----------
 
-summary = spark.createDataFrame(results, "table STRING, rows_in LONG, rows_out LONG, rows_removed LONG")
+summary = spark.createDataFrame(results, "table STRING, rows_in LONG, rows_out LONG, rows_removed LONG, write STRING")
 display(summary) if "display" in globals() else summary.show(truncate=False)
 total_out = sum(r[2] for r in results)
 print(f"TOTAL silver rows: {total_out:,}")

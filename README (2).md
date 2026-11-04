@@ -50,13 +50,36 @@ Orchestration: Databricks Workflow (bronze → silver → gold task chain)
 - Raw CSVs land in a Unity Catalog Volume: `/Volumes/workspace/bronze/landing/olist/<load_date>/`.
 - `01_bronze_load` picks the latest load folder automatically and writes each file to a `workspace.bronze.*` Delta table, kept as strings.
 - Audit columns: `_ingested_at`, `_source_file` (from `_metadata.file_path`), `_load_date`.
-- **Rows ingested:** _TODO_
+- **Rows ingested:** ~1.55M across 9 tables
+
+![Bronze load](docs/bronze_tables.png)
 
 ### Silver: cleaned and validated
-_TODO: type casting, deduplication, null handling, data quality checks_
+- `02_silver_transform` casts types with `try_cast` (bad values become NULL instead of failing), standardizes text, pads zip codes, fixes source column typos, and removes duplicates per business key.
+- Every row gets a `_row_hash`. Tables are written with **Delta MERGE** (insert new, update changed, delete removed), so only rows that actually changed get a new `_processed_at`.
+- `03_data_quality_checks` runs **32 automated checks** (completeness, primary keys, referential integrity, value ranges, valid statuses) and logs every result to `silver.dq_results`. `error` checks stop the Workflow; `warn` checks are logged only.
+
+![Data quality results](docs/dq_results.png)
 
 ### Gold: star schema
-_TODO: fact_sales, dim_customer (SCD2), dim_product, dim_seller, dim_date; Delta MERGE incremental logic_
+`04_gold_model` builds the reporting layer:
+
+| Table | Grain / type | Load method |
+|---|---|---|
+| `fact_sales` | 1 row per order item | MERGE upsert on `(order_id, order_item_id)` |
+| `dim_customer` | **SCD Type 2** | MERGE that expires the old version and inserts the new one |
+| `dim_product`, `dim_seller` | SCD Type 1 | MERGE upsert |
+| `dim_date` | Calendar | Rebuilt each run |
+| `load_log` | Run history | Mode, duration, watermark, rows processed |
+
+**Incremental mode** reads only silver rows whose `_processed_at` is newer than the last successful run's watermark.
+
+**SCD Type 2** keeps customer address history. The source is staged twice in one atomic MERGE: rows keyed by `customer_id` expire the current version, and changed rows with a NULL key are inserted as the new version.
+
+![SCD Type 2 history](docs/scd2_history.png)
+
+### Testing incremental loads
+Olist is a one-time snapshot, so `05_simulate_new_batch` creates a realistic next-day batch: **500 customers move**, **1,000 new orders** (half from customers who moved), and **300 shipped orders become delivered**. The full pipeline then runs incrementally.
 
 ### Streaming
 _TODO: Auto Loader ingestion of new order files_
@@ -69,10 +92,10 @@ _TODO: report screenshots_
 `retail_lakehouse_pipeline` is a Databricks Workflow that runs the notebooks as dependent tasks:
 
 ```
-bronze_load ──► silver_transform ──► gold_model
+bronze_load ──► silver_transform ──► dq_checks ──► gold_model
 ```
 
-_TODO: add a screenshot of a successful run._
+![Workflow run](docs/workflow_run.png)
 
 ## Design Decisions
 
@@ -80,15 +103,22 @@ _TODO: add a screenshot of a successful run._
 - **Bronze kept as raw strings:** no data loss at ingestion; all typing and cleaning happens in silver, so bronze can always be replayed.
 - **Date-partitioned landing folders:** each load is traceable, and the pipeline automatically picks the latest one.
 - **`_metadata.file_path` for lineage:** the Unity Catalog-compatible replacement for `input_file_name()`.
-- _TODO: add more as built_
+- **Row hashes + watermark:** cheap change detection. Silver only stamps rows that really changed, and gold processes just those.
+- **Quality gate before gold:** `error` checks fail the Workflow, so bad data never reaches reporting tables.
+- **Fact rows keep their original `customer_key` on update:** historical sales stay linked to the customer version that was current when they were loaded.
+- **Full mode resets SCD2 history:** it rebuilds `dim_customer` from current data, which is why incremental is the default.
 
 ## Results
 
 | Metric | Value |
 |--------|-------|
-| Total records processed | _TODO_ |
-| Incremental vs full reload runtime | _TODO_ |
-| Automated data quality checks | _TODO_ |
+| Total records ingested (bronze) | ~1.55M across 9 tables |
+| Fact rows processed: full load | 112,650 (24.4s) |
+| Fact rows processed: incremental load | **1,484** (23.4s), **~99% less data** |
+| Customer rows processed: incremental | 500 (all moved customers, history kept) |
+| Automated data quality checks | 32 |
+
+**Why runtime barely changed:** at ~100K rows, fixed overhead (serverless job startup, rebuilding `dim_date`, MERGE scanning the target) dominates. Full reloads grow with *total* data volume; incremental loads grow only with the *changes*, so the gap widens as data grows.
 
 ## Repository Structure
 
@@ -104,7 +134,8 @@ _TODO: add a screenshot of a successful run._
 1. Create a [Databricks Free Edition](https://www.databricks.com/learn/free-edition) workspace.
 2. Run `00_setup` to create the `bronze`, `silver` and `gold` schemas and the landing Volume.
 3. Upload the CSVs from `data/raw/` to the landing Volume folder printed by `00_setup`.
-4. Import the notebooks from `notebooks/` and run the `retail_lakehouse_pipeline` Workflow (or the notebooks in order).
+4. Import the notebooks from `notebooks/` and run them in order (`01` → `04`). The first `04_gold_model` run does a full load automatically.
+5. To test incremental loading: run `05_simulate_new_batch`, then the `retail_lakehouse_pipeline` Workflow.
 
 ## Author
 
