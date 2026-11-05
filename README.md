@@ -81,8 +81,25 @@ Orchestration: Databricks Workflow (bronze → silver → gold task chain)
 ### Testing incremental loads
 Olist is a one-time snapshot, so `05_simulate_new_batch` creates a realistic next-day batch: **500 customers move**, **1,000 new orders** (half from customers who moved), and **300 shipped orders become delivered**. The full pipeline then runs incrementally.
 
-### Streaming
-_TODO: Auto Loader ingestion of new order files_
+### Streaming: Auto Loader
+Simulates a live order feed and ingests it incrementally:
+
+- `06_order_event_generator` drops JSON order-event files into a landing Volume (5 files and ~300 events per run, using real customer, product and seller IDs). About **2% of events are re-sent** with the same `event_id`, like a real at-least-once feed.
+- `07_stream_orders` uses **Auto Loader** (`cloudFiles`) with an explicit schema to stream new files into `bronze.order_events`:
+  - a **checkpoint** records which files have been read, so each run processes **only new files, exactly once**
+  - `dropDuplicatesWithinWatermark(["event_id"])` removes re-sent events (1-hour watermark)
+  - `trigger(availableNow=True)` processes everything new and then stops, the standard pattern for streams inside a scheduled job
+- Three **gold views** serve "today's sales": `v_todays_sales` (orders, items, revenue, average order value), `v_todays_sales_by_hour`, and `v_todays_top_categories` (joined to `dim_product`).
+
+| Run | Behaviour |
+|---|---|
+| 1st | New files ingested, duplicates dropped |
+| 2nd (after new files arrive) | **Only the new files** are read; earlier files are skipped via the checkpoint |
+| Re-run with no new files | **0 events read**, no duplicates created |
+
+![Second stream run](docs/stream_second_run.png)
+
+![Today's sales](docs/todays_sales.png)
 
 ### Power BI
 _TODO: report screenshots_
@@ -92,7 +109,7 @@ _TODO: report screenshots_
 `retail_lakehouse_pipeline` is a Databricks Workflow that runs the notebooks as dependent tasks:
 
 ```
-bronze_load ──► silver_transform ──► dq_checks ──► gold_model
+bronze_load ──► silver_transform ──► dq_checks ──► gold_model ──► stream_orders
 ```
 
 ![Workflow run](docs/workflow_run.png)
@@ -107,6 +124,8 @@ bronze_load ──► silver_transform ──► dq_checks ──► gold_model
 - **Quality gate before gold:** `error` checks fail the Workflow, so bad data never reaches reporting tables.
 - **Fact rows keep their original `customer_key` on update:** historical sales stay linked to the customer version that was current when they were loaded.
 - **Full mode resets SCD2 history:** it rebuilds `dim_customer` from current data, which is why incremental is the default.
+- **Explicit schema for the stream:** types are enforced on read instead of inferred, so a malformed file can't silently change the table's schema.
+- **`availableNow` trigger:** serverless compute doesn't support always-on streams, and batch-style streaming inside a job is cheaper anyway; latency equals the job schedule.
 
 ## Results
 
@@ -136,6 +155,7 @@ bronze_load ──► silver_transform ──► dq_checks ──► gold_model
 3. Upload the CSVs from `data/raw/` to the landing Volume folder printed by `00_setup`.
 4. Import the notebooks from `notebooks/` and run them in order (`01` → `04`). The first `04_gold_model` run does a full load automatically.
 5. To test incremental loading: run `05_simulate_new_batch`, then the `retail_lakehouse_pipeline` Workflow.
+6. To test streaming: run `06_order_event_generator`, then `07_stream_orders` (repeat to see only new files picked up).
 
 ## Author
 
