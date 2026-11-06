@@ -2,7 +2,7 @@
 
 An end-to-end data engineering project that builds a **medallion-architecture Lakehouse** (bronze → silver → gold) on **Databricks** with **Delta Lake** and **Unity Catalog**, using the Olist Brazilian e-commerce dataset. It includes incremental loads with Delta MERGE, a star-schema model with SCD Type 2 dimensions, streaming ingestion, automated data quality checks, and a Power BI report.
 
-> 🚧 Status: in active development. Sections marked _TODO_ are filled in as each layer is completed.
+> ✅ Status: complete. Ingestion, cleaning, quality checks, star schema, incremental loads, streaming, orchestration and reporting.
 
 ---
 
@@ -37,7 +37,7 @@ Orchestration: Databricks Workflow (bronze → silver → gold task chain)
 | Modeling | Star schema, SCD Type 2, Delta MERGE incremental loads |
 | Streaming | Auto Loader, Structured Streaming |
 | Orchestration | Databricks Workflows (Jobs) |
-| Serving | Databricks SQL warehouse, Power BI Desktop |
+| Serving | Databricks SQL warehouse, Power BI Desktop (star-schema model, DAX) |
 | Version control | Git / GitHub |
 
 ## Dataset
@@ -101,8 +101,25 @@ Simulates a live order feed and ingests it incrementally:
 
 ![Today's sales](docs/todays_sales.png)
 
-### Power BI
-_TODO: report screenshots_
+### Power BI report
+`powerbi/retail_sales_report.pbix` connects to the **gold** tables through a Databricks SQL warehouse (Import mode).
+
+**Data model:** a star schema, with `fact_sales` joined many-to-one to `dim_customer` (on the SCD2 surrogate `customer_key`), `dim_product`, `dim_seller` and `dim_date` (marked as the date table).
+
+![Power BI model](docs/powerbi_model.png)
+
+**Measures (DAX):** Revenue, Orders, Items Sold, Avg Order Value, Avg Delivery Days, Late Delivery %.
+
+![Power BI report](docs/powerbi_report.png)
+
+**Key insights (2016–2018):**
+- **R$ 15.84M** revenue from **~99K orders**, average order value **R$ 160.58**
+- Revenue grew steadily through 2017 and peaked in **November 2017 (Black Friday)**
+- **health_beauty, watches_gifts and bed_bath_table** are the top revenue categories
+- **São Paulo (SP)** generates far more revenue than any other state
+- **8.4%** of delivered orders arrive late, but north-eastern states like **MA and CE** see **2× that rate**, which points to a regional logistics issue
+
+> The report filters to 2016–2018, so the simulated test orders (dated 2026) are excluded. The final month (2018-09) is incomplete in the source data.
 
 ## Orchestration
 
@@ -143,7 +160,8 @@ bronze_load ──► silver_transform ──► dq_checks ──► gold_model 
 
 ```
 ├── data/raw/      # source CSVs
-├── notebooks/     # exported Databricks notebooks (.ipynb)
+├── notebooks/     # Databricks notebooks (00–07)
+├── powerbi/       # Power BI report (.pbix)
 ├── pipelines/     # Workflow (job) definitions and screenshots
 └── docs/          # architecture diagram, screenshots
 ```
